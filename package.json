@@ -1,0 +1,12 @@
+{
+  "name": "durant-price-server",
+  "version": "1.0.0",
+  "description": "Koers cache server voor Durant Portfolio Tracker",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
