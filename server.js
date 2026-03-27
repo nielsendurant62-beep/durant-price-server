@@ -12,7 +12,7 @@ const PORT           = process.env.PORT || 3000;
 const INTERVAL_MS    = 6 * 60 * 1000; // 6 minuten tussen rondes
 
 const TICKERS = [
-  'AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK/B',
+  'AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK.B',
   'JPM','V','JNJ','WMT','NFLX','DIS','AMD','INTC','PYPL','UBER',
   'COIN','MSTR','ASMLF','LVMUY','SAPGF','NSRGY','NVO','SIEGY',
   'SNYNF','EADSY','PHG','BUD',
@@ -53,8 +53,6 @@ async function fetchBatch(tickers) {
   const data = await httpsGet(url);
 
   // Log ruwe response voor debugging
-  console.log(`  Raw keys: ${Object.keys(data).slice(0,5).join(', ')}...`);
-  console.log(`  First entry type: ${typeof Object.values(data)[0]}`);
 
   const results = {};
 
@@ -110,6 +108,8 @@ async function fetchAllPrices() {
 
     try {
       const results = await fetchBatch(batch);
+      // Twelve Data gebruikt BRK.B — app verwacht BRK/B
+      if (results['BRK.B']) { results['BRK/B'] = results['BRK.B']; delete results['BRK.B']; }
       Object.assign(newPrices, results);
     } catch(e) {
       console.log(`  Batch fout: ${e.message}`);
