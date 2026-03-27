@@ -1,16 +1,16 @@
 // ══════════════════════════════════════════════════
 //  Durant Portfolio — Price Cache Server
-//  Haalt koersen op via Polygon.io (gratis plan)
-//  en serveert die als JSON endpoint aan iedereen
+//  1 batch call elke 5 min via Twelve Data
+//  288 calls/dag — limiet: 800/dag
 // ══════════════════════════════════════════════════
 
 const https = require('https');
 const http  = require('http');
 
-const POLYGON_KEY = process.env.POLYGON_KEY || 'ItxLGprLetR2gGAYFgLI3PKJOxy77Li3';
-const PORT        = process.env.PORT || 3000;
+const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY || '68ab66a22fc54644871caf2ece8cf856';
+const PORT           = process.env.PORT || 3000;
+const INTERVAL_MS    = 5 * 60 * 1000; // 5 minuten
 
-// Alle tickers — BRK/B wordt intern BRK.B voor Polygon
 const TICKERS = [
   'AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK/B',
   'JPM','V','JNJ','WMT','NFLX','DIS','AMD','INTC','PYPL','UBER',
@@ -20,12 +20,10 @@ const TICKERS = [
 ];
 
 let priceCache = { updatedAt: null, eurUsd: 1.08, prices: {} };
-let isFetching = false;
 
-// ── HTTPS GET helper ──
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { timeout: 12000 }, res => {
+    const req = https.get(url, { timeout: 15000 }, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -38,9 +36,6 @@ function httpsGet(url) {
   });
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ── EUR/USD via Frankfurter ──
 async function fetchEurUsd() {
   try {
     const d = await httpsGet('https://api.frankfurter.app/latest?from=EUR&to=USD');
@@ -48,53 +43,33 @@ async function fetchEurUsd() {
   } catch { return priceCache.eurUsd; }
 }
 
-// ── Haal 1 ticker op via Polygon /prev ──
-async function fetchOne(ticker) {
-  const sym = ticker.replace('/', '.');
-  try {
-    const d   = await httpsGet(`https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(sym)}/prev?adjusted=true&apiKey=${POLYGON_KEY}`);
-    const bar = d?.results?.[0];
-    if (!bar?.c) return null;
-    const change24h = bar.o ? ((bar.c - bar.o) / bar.o) * 100 : 0;
-    return { price: bar.c, change24h };
-  } catch { return null; }
-}
-
-// ── Haal alle tickers op in batches van 5 (gratis: 5 calls/min) ──
 async function fetchAllPrices() {
-  if (isFetching) return;
-  isFetching = true;
-  console.log(`\n[${new Date().toISOString()}] Start ophalen ${TICKERS.length} tickers...`);
+  console.log(`[${new Date().toISOString()}] Batch call voor ${TICKERS.length} tickers...`);
+  try {
+    const symbols = TICKERS.join(',');
+    const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbols)}&apikey=${TWELVEDATA_KEY}`;
+    const data = await httpsGet(url);
 
-  const newPrices = { ...priceCache.prices };
-  const BATCH     = 5;
-
-  for (let i = 0; i < TICKERS.length; i += BATCH) {
-    const batch   = TICKERS.slice(i, i + BATCH);
-    const results = await Promise.all(batch.map(t => fetchOne(t)));
-
-    batch.forEach((ticker, idx) => {
-      if (results[idx]) {
-        newPrices[ticker] = results[idx];
-        console.log(`  v ${ticker}: $${results[idx].price.toFixed(2)}`);
-      } else {
-        console.log(`  x ${ticker}: mislukt`);
+    const newPrices = {};
+    Object.entries(data).forEach(([ticker, quote]) => {
+      if (quote.status === 'error' || !quote.close) return;
+      const price     = parseFloat(quote.close);
+      const prev      = parseFloat(quote.previous_close) || price;
+      const change24h = prev ? ((price - prev) / prev) * 100 : 0;
+      if (!isNaN(price)) {
+        newPrices[ticker] = { price, change24h };
+        console.log(`  v ${ticker}: $${price.toFixed(2)} (${change24h>=0?'+':''}${change24h.toFixed(2)}%)`);
       }
     });
 
-    if (i + BATCH < TICKERS.length) {
-      console.log(`  -- wachten 61s --`);
-      await sleep(61000);
-    }
+    priceCache.prices    = newPrices;
+    priceCache.updatedAt = new Date().toISOString();
+    console.log(`  Klaar: ${Object.keys(newPrices).length}/${TICKERS.length} tickers — 1 API call\n`);
+  } catch(e) {
+    console.error(`  Fout: ${e.message}`);
   }
-
-  priceCache.prices    = newPrices;
-  priceCache.updatedAt = new Date().toISOString();
-  console.log(`[${new Date().toISOString()}] Klaar: ${Object.keys(newPrices).length}/${TICKERS.length} tickers\n`);
-  isFetching = false;
 }
 
-// ── HTTP Server ──
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -110,29 +85,25 @@ const server = http.createServer((req, res) => {
 
   if (req.url === '/health') {
     const count = Object.keys(priceCache.prices).length;
-    const busy  = isFetching ? ' (bezig met verversen...)' : '';
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(`OK -- ${count}/${TICKERS.length} tickers geladen, bijgewerkt: ${priceCache.updatedAt || 'nog bezig'}${busy}`);
+    res.end(`OK -- ${count}/${TICKERS.length} tickers, bijgewerkt: ${priceCache.updatedAt || 'nog bezig'}`);
     return;
   }
 
   res.writeHead(404); res.end('Not found');
 });
 
-// ── Start ──
 (async () => {
-  server.listen(PORT, () => console.log(`Server op poort ${PORT}`));
+  server.listen(PORT, () => console.log(`\nServer op poort ${PORT} -- /prices en /health\n`));
 
   priceCache.eurUsd = await fetchEurUsd();
   console.log(`EUR/USD: ${priceCache.eurUsd}`);
 
-  fetchAllPrices();
+  await fetchAllPrices();
 
-  // Herhaal elke 15 minuten
-  setInterval(fetchAllPrices, 15 * 60 * 1000);
-
-  // EUR/USD elk uur
+  setInterval(fetchAllPrices, INTERVAL_MS);
   setInterval(async () => {
     priceCache.eurUsd = await fetchEurUsd();
+    console.log(`EUR/USD ververst: ${priceCache.eurUsd}`);
   }, 60 * 60 * 1000);
 })();
