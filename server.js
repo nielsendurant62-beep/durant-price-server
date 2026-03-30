@@ -1,8 +1,7 @@
 // ══════════════════════════════════════════════════
 //  Durant Portfolio — Price Cache Server
-//  Twelve Data /price endpoint:
-//  40 tickers in 1 call = 1 credit
-//  Elke 5 min = 288 credits/dag (limiet: 800)
+//  Twelve Data /price = 1 credit voor alle tickers
+//  288 credits/dag (limiet: 800)
 // ══════════════════════════════════════════════════
 
 const https = require('https');
@@ -20,8 +19,9 @@ const TICKERS = [
   'SPY','QQQ','IWM','VTI','VEA','EEM','GLD','TLT','IEMG','URTH'
 ];
 
-let priceCache = { updatedAt: null, eurUsd: 1.08, prices: {} };
-let isFetching = false;
+let priceCache  = { updatedAt: null, eurUsd: 1.08, prices: {} };
+let prevCloses  = {}; // ticker -> previous close prijs
+let isFetching  = false;
 
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
@@ -45,47 +45,70 @@ async function fetchEurUsd() {
   } catch { return priceCache.eurUsd; }
 }
 
+// Verwerk Twelve Data response — werkt voor zowel 1 als meerdere tickers
+function parseTwelveDataResponse(data, endpoint) {
+  const results = {};
+
+  // Check of het een foutmelding is
+  if (data.code && data.message) {
+    console.log(`  API fout: ${data.message}`);
+    return results;
+  }
+
+  // Bepaal of het 1 ticker (plat object) of meerdere tickers (genest object) is
+  const firstVal = Object.values(data)[0];
+  const isMulti  = firstVal && typeof firstVal === 'object' && !Array.isArray(firstVal);
+
+  if (isMulti) {
+    // Meerdere tickers: { AAPL: { price: '246' }, MSFT: { price: '357' } }
+    Object.entries(data).forEach(([ticker, val]) => {
+      if (!val || val.code || val.status === 'error') {
+        console.log(`  x ${ticker}: ${val?.message || 'fout'}`);
+        return;
+      }
+      const price = parseFloat(val.price || val.close);
+      if (price && !isNaN(price)) results[ticker] = price;
+    });
+  } else if (data.price || data.close) {
+    // 1 ticker: { price: '246', symbol: 'AAPL' }
+    const ticker = data.symbol || TICKERS[0];
+    const price  = parseFloat(data.price || data.close);
+    if (price && !isNaN(price)) results[ticker] = price;
+  }
+
+  return results;
+}
+
 async function fetchAllPrices() {
   if (isFetching) { console.log('Al bezig, sla over.'); return; }
   isFetching = true;
-  console.log(`\n[${new Date().toISOString()}] Ophalen ${TICKERS.length} tickers (1 credit)...`);
+  console.log(`\n[${new Date().toISOString()}] Ophalen ${TICKERS.length} tickers — 1 credit...`);
 
   try {
-    // /price endpoint: alle tickers in 1 call = 1 credit
-    // Geeft { AAPL: { price: '...' }, MSFT: { price: '...' }, ... }
     const symbols = TICKERS.join(',');
     const url     = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbols)}&apikey=${TWELVEDATA_KEY}`;
     const data    = await httpsGet(url);
 
-    const newPrices = { ...priceCache.prices };
+    // Debug: log eerste stuk van response
+    console.log(`  Response preview: ${JSON.stringify(data).slice(0, 150)}`);
 
-    // Haal ook previous_close op voor change% — dat doe je 1x per dag via /eod
-    // Maar /price geeft geen previous_close, dus we berekenen change uit gecachte vorige waarde
+    const rawPrices = parseTwelveDataResponse(data, 'price');
+    const newPrices = { ...priceCache.prices };
     let loaded = 0;
 
-    // Verwerk response — Twelve Data geeft object van objecten bij meerdere tickers
-    Object.entries(data).forEach(([ticker, val]) => {
-      if (!val || val.status === 'error') {
-        console.log(`  x ${ticker}: ${val?.message || 'geen data'}`);
-        return;
-      }
-
-      const price = parseFloat(val.price);
-      if (!price || isNaN(price)) return;
-
-      // Change berekenen tov vorige gecachte prijs
-      const prev      = newPrices[ticker]?.price || price;
+    Object.entries(rawPrices).forEach(([ticker, price]) => {
+      const prev      = prevCloses[ticker] || newPrices[ticker]?.price || price;
       const change24h = prev ? ((price - prev) / prev) * 100 : 0;
-
-      // BRK/B fix: Twelve Data stuurt BRK/B, app verwacht ook BRK/B — geen remapping nodig
-      newPrices[ticker] = { price, change24h };
+      // BRK/B: Twelve Data kan BRK%2FB of BRK/B teruggeven
+      const key = ticker.replace('%2F', '/');
+      newPrices[key] = { price, change24h };
       loaded++;
-      console.log(`  v ${ticker}: $${price.toFixed(2)}`);
+      console.log(`  v ${key}: $${price.toFixed(2)}`);
     });
 
     priceCache.prices    = newPrices;
     priceCache.updatedAt = new Date().toISOString();
-    console.log(`[${new Date().toISOString()}] Klaar: ${loaded}/${TICKERS.length} tickers — 1 credit gebruikt\n`);
+    console.log(`[${new Date().toISOString()}] Klaar: ${loaded}/${TICKERS.length} tickers — 1 credit\n`);
 
   } catch(e) {
     console.error(`Fout: ${e.message}`);
@@ -94,24 +117,18 @@ async function fetchAllPrices() {
   isFetching = false;
 }
 
-// Haal 1x per dag previous close op voor accurate change% — 1 credit
+// Haal previous close op via /eod — 1 credit, 1x per dag
 async function fetchPreviousClose() {
   try {
     const symbols = TICKERS.join(',');
     const url     = `https://api.twelvedata.com/eod?symbol=${encodeURIComponent(symbols)}&apikey=${TWELVEDATA_KEY}`;
     const data    = await httpsGet(url);
+    const closes  = parseTwelveDataResponse(data, 'eod');
 
-    Object.entries(data).forEach(([ticker, val]) => {
-      if (!val || val.status === 'error') return;
-      const close = parseFloat(val.close);
-      if (!close || isNaN(close)) return;
-      if (priceCache.prices[ticker]) {
-        const cur = priceCache.prices[ticker].price || close;
-        priceCache.prices[ticker].change24h = ((cur - close) / close) * 100;
-        priceCache.prices[ticker].prevClose = close;
-      }
+    Object.entries(closes).forEach(([ticker, price]) => {
+      prevCloses[ticker.replace('%2F', '/')] = price;
     });
-    console.log(`[${new Date().toISOString()}] Previous close bijgewerkt (1 credit)`);
+    console.log(`[${new Date().toISOString()}] Previous close: ${Object.keys(closes).length} tickers (1 credit)`);
   } catch(e) {
     console.error(`Previous close fout: ${e.message}`);
   }
@@ -143,25 +160,18 @@ const server = http.createServer((req, res) => {
 (async () => {
   server.listen(PORT, () => {
     console.log(`\nServer op poort ${PORT}`);
-    console.log(`Gebruik: 1 credit per 5 min = 288 credits/dag (limiet: 800)\n`);
+    console.log(`Plan: 1 credit/5min = max 290 credits/dag (limiet 800)\n`);
   });
 
   priceCache.eurUsd = await fetchEurUsd();
   console.log(`EUR/USD: ${priceCache.eurUsd}`);
 
-  // Meteen ophalen bij start
-  await fetchPreviousClose(); // 1 credit voor accurate change%
-  await fetchAllPrices();     // 1 credit voor live prijzen
+  await fetchPreviousClose();
+  await fetchAllPrices();
 
-  // Live prijzen elke 5 minuten (1 credit per keer)
   setInterval(fetchAllPrices, INTERVAL_MS);
-
-  // Previous close 1x per dag om middernacht (1 credit)
   setInterval(fetchPreviousClose, 24 * 60 * 60 * 1000);
-
-  // EUR/USD elk uur
   setInterval(async () => {
     priceCache.eurUsd = await fetchEurUsd();
-    console.log(`EUR/USD ververst: ${priceCache.eurUsd}`);
   }, 60 * 60 * 1000);
 })();
