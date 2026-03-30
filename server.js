@@ -1,7 +1,8 @@
 // ══════════════════════════════════════════════════
 //  Durant Portfolio — Price Cache Server
-//  Twelve Data /price = 1 credit voor alle tickers
-//  288 credits/dag (limiet: 800)
+//  Alleen verversen als beurs open is
+//  NYSE: ma-vr 15:30-22:00 Belgische tijd
+//  Elke 20 min tijdens beurs = max 760 credits/dag
 // ══════════════════════════════════════════════════
 
 const https = require('https');
@@ -9,7 +10,6 @@ const http  = require('http');
 
 const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY || '68ab66a22fc54644871caf2ece8cf856';
 const PORT           = process.env.PORT || 3000;
-const INTERVAL_MS    = 5 * 60 * 1000; // 5 minuten
 
 const TICKERS = [
   'AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK/B',
@@ -19,9 +19,8 @@ const TICKERS = [
   'SPY','QQQ','IWM','VTI','VEA','EEM','GLD','TLT','IEMG','URTH'
 ];
 
-let priceCache  = { updatedAt: null, eurUsd: 1.08, prices: {} };
-let prevCloses  = {}; // ticker -> previous close prijs
-let isFetching  = false;
+let priceCache = { updatedAt: null, eurUsd: 1.08, prices: {}, marketOpen: false };
+let isFetching = false;
 
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
@@ -30,13 +29,15 @@ function httpsGet(url) {
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error('JSON parse: ' + e.message)); }
+        catch(e) { reject(new Error('JSON parse')); }
       });
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
   });
 }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function fetchEurUsd() {
   try {
@@ -45,92 +46,144 @@ async function fetchEurUsd() {
   } catch { return priceCache.eurUsd; }
 }
 
-// Verwerk Twelve Data response — werkt voor zowel 1 als meerdere tickers
-function parseTwelveDataResponse(data, endpoint) {
-  const results = {};
+// ── Controleer of NYSE open is (Belgische tijd) ──
+function isMarketOpen() {
+  // Huidige tijd in Belgische tijdzone
+  const now    = new Date();
+  const bel    = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Brussels' }));
+  const day    = bel.getDay();   // 0=zo, 1=ma, ..., 5=vr, 6=za
+  const hour   = bel.getHours();
+  const minute = bel.getMinutes();
+  const time   = hour * 60 + minute; // minuten sinds middernacht
 
-  // Check of het een foutmelding is
-  if (data.code && data.message) {
-    console.log(`  API fout: ${data.message}`);
-    return results;
+  // Alleen weekdagen
+  if (day === 0 || day === 6) return false;
+
+  // NYSE: 09:30-16:00 ET = 15:30-22:00 CET (winter) / 15:30-22:00 CEST (zomer)
+  // Europe/Brussels past automatisch aan voor zomer/wintertijd
+  // ET is altijd 6 uur achter op CET en 6 uur achter op CEST
+  const open  = 15 * 60 + 30; // 15:30
+  const close = 22 * 60;      // 22:00
+
+  return time >= open && time < close;
+}
+
+// ── Tijdstip tot markt opengaat of sluit ──
+function minutesUntilNextEvent() {
+  const now  = new Date();
+  const bel  = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Brussels' }));
+  const day  = bel.getDay();
+  const time = bel.getHours() * 60 + bel.getMinutes();
+  const open = 15 * 60 + 30;
+
+  if (isMarketOpen()) {
+    // Minuten tot sluiting
+    return (22 * 60) - time;
+  } else {
+    // Minuten tot opening (vandaag of volgende werkdag)
+    if (day >= 1 && day <= 5 && time < open) {
+      return open - time;
+    }
+    // Weekend of na sluitingstijd → volgende werkdag
+    let daysUntilMonday = 1;
+    if (day === 5 && time >= 22 * 60) daysUntilMonday = 3;
+    else if (day === 6) daysUntilMonday = 2;
+    else if (day === 0) daysUntilMonday = 1;
+    else daysUntilMonday = 1;
+    return daysUntilMonday * 24 * 60 - time + open;
   }
+}
 
-  // Bepaal of het 1 ticker (plat object) of meerdere tickers (genest object) is
-  const firstVal = Object.values(data)[0];
-  const isMulti  = firstVal && typeof firstVal === 'object' && !Array.isArray(firstVal);
+async function fetchBatch(tickers) {
+  const symbols = tickers.join(',');
+  const url     = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbols)}&apikey=${TWELVEDATA_KEY}`;
+  const data    = await httpsGet(url);
 
-  if (isMulti) {
-    // Meerdere tickers: { AAPL: { price: '246' }, MSFT: { price: '357' } }
+  if (data.code === 429) throw new Error('Rate limit: ' + data.message);
+
+  const results = {};
+  const first   = Object.values(data)[0];
+
+  if (first && typeof first === 'object') {
     Object.entries(data).forEach(([ticker, val]) => {
-      if (!val || val.code || val.status === 'error') {
-        console.log(`  x ${ticker}: ${val?.message || 'fout'}`);
-        return;
-      }
-      const price = parseFloat(val.price || val.close);
-      if (price && !isNaN(price)) results[ticker] = price;
+      const p = parseFloat(val?.price);
+      if (p && !isNaN(p)) results[ticker] = p;
+      else console.log(`  x ${ticker}: ${val?.message || 'geen prijs'}`);
     });
-  } else if (data.price || data.close) {
-    // 1 ticker: { price: '246', symbol: 'AAPL' }
-    const ticker = data.symbol || TICKERS[0];
-    const price  = parseFloat(data.price || data.close);
-    if (price && !isNaN(price)) results[ticker] = price;
+  } else if (data.price) {
+    const p = parseFloat(data.price);
+    if (p) results[tickers[0]] = p;
   }
 
   return results;
 }
 
 async function fetchAllPrices() {
-  if (isFetching) { console.log('Al bezig, sla over.'); return; }
-  isFetching = true;
-  console.log(`\n[${new Date().toISOString()}] Ophalen ${TICKERS.length} tickers — 1 credit...`);
+  if (isFetching) return;
 
-  try {
-    const symbols = TICKERS.join(',');
-    const url     = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(symbols)}&apikey=${TWELVEDATA_KEY}`;
-    const data    = await httpsGet(url);
-
-    // Debug: log eerste stuk van response
-    console.log(`  Response preview: ${JSON.stringify(data).slice(0, 150)}`);
-
-    const rawPrices = parseTwelveDataResponse(data, 'price');
-    const newPrices = { ...priceCache.prices };
-    let loaded = 0;
-
-    Object.entries(rawPrices).forEach(([ticker, price]) => {
-      const prev      = prevCloses[ticker] || newPrices[ticker]?.price || price;
-      const change24h = prev ? ((price - prev) / prev) * 100 : 0;
-      // BRK/B: Twelve Data kan BRK%2FB of BRK/B teruggeven
-      const key = ticker.replace('%2F', '/');
-      newPrices[key] = { price, change24h };
-      loaded++;
-      console.log(`  v ${key}: $${price.toFixed(2)}`);
-    });
-
-    priceCache.prices    = newPrices;
-    priceCache.updatedAt = new Date().toISOString();
-    console.log(`[${new Date().toISOString()}] Klaar: ${loaded}/${TICKERS.length} tickers — 1 credit\n`);
-
-  } catch(e) {
-    console.error(`Fout: ${e.message}`);
+  if (!isMarketOpen()) {
+    const min  = minutesUntilNextEvent();
+    const uur  = Math.floor(min / 60);
+    const rest = min % 60;
+    priceCache.marketOpen = false;
+    console.log(`[${new Date().toISOString()}] Beurs gesloten. Opent over ${uur}u${rest}m`);
+    return;
   }
 
+  isFetching = true;
+  priceCache.marketOpen = true;
+  console.log(`\n[${new Date().toISOString()}] Beurs OPEN — ophalen ${TICKERS.length} tickers...`);
+
+  const newPrices = { ...priceCache.prices };
+  const BATCH     = 8;
+  let   loaded    = 0;
+
+  for (let i = 0; i < TICKERS.length; i += BATCH) {
+    const batch = TICKERS.slice(i, i + BATCH);
+    console.log(`  Batch ${Math.floor(i/BATCH)+1}: ${batch.join(',')}`);
+
+    try {
+      const raw = await fetchBatch(batch);
+      Object.entries(raw).forEach(([ticker, price]) => {
+        const key       = ticker.replace('BRK%2FB', 'BRK/B');
+        const prev      = newPrices[key]?.price || price;
+        const change24h = ((price - prev) / prev) * 100;
+        newPrices[key]  = { price, change24h };
+        loaded++;
+        console.log(`  v ${key}: $${price.toFixed(2)}`);
+      });
+    } catch(e) {
+      console.log(`  Fout: ${e.message}`);
+      if (e.message.includes('Rate limit')) {
+        console.log('  Rate limit bereikt, stop deze ronde.');
+        break;
+      }
+    }
+
+    if (i + BATCH < TICKERS.length) {
+      console.log('  Wacht 62s...');
+      await sleep(62000);
+    }
+  }
+
+  priceCache.prices    = newPrices;
+  priceCache.updatedAt = new Date().toISOString();
+  console.log(`[${new Date().toISOString()}] Klaar: ${loaded}/${TICKERS.length} tickers\n`);
   isFetching = false;
 }
 
-// Haal previous close op via /eod — 1 credit, 1x per dag
-async function fetchPreviousClose() {
-  try {
-    const symbols = TICKERS.join(',');
-    const url     = `https://api.twelvedata.com/eod?symbol=${encodeURIComponent(symbols)}&apikey=${TWELVEDATA_KEY}`;
-    const data    = await httpsGet(url);
-    const closes  = parseTwelveDataResponse(data, 'eod');
+// ── Check elke minuut of beurs open is ──
+// Wanneer open: haal op. Maar wacht 20 min tussen rondes.
+let lastFetchTime = 0;
+const FETCH_INTERVAL = 20 * 60 * 1000; // 20 minuten tussen rondes
 
-    Object.entries(closes).forEach(([ticker, price]) => {
-      prevCloses[ticker.replace('%2F', '/')] = price;
-    });
-    console.log(`[${new Date().toISOString()}] Previous close: ${Object.keys(closes).length} tickers (1 credit)`);
-  } catch(e) {
-    console.error(`Previous close fout: ${e.message}`);
+async function tick() {
+  const now = Date.now();
+  if (isMarketOpen() && (now - lastFetchTime) >= FETCH_INTERVAL) {
+    lastFetchTime = now;
+    await fetchAllPrices();
+  } else if (!isMarketOpen()) {
+    priceCache.marketOpen = false;
   }
 }
 
@@ -148,9 +201,12 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.url === '/health') {
-    const count = Object.keys(priceCache.prices).length;
+    const count  = Object.keys(priceCache.prices).length;
+    const status = priceCache.marketOpen ? '🟢 Beurs OPEN' : '🔴 Beurs gesloten';
+    const min    = minutesUntilNextEvent();
+    const event  = priceCache.marketOpen ? `Sluit over ${min}min` : `Opent over ${min}min`;
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(`OK -- ${count}/${TICKERS.length} tickers, bijgewerkt: ${priceCache.updatedAt || 'nog bezig'}`);
+    res.end(`${status} — ${event}\n${count}/${TICKERS.length} tickers\nBijgewerkt: ${priceCache.updatedAt || 'nog niet'}`);
     return;
   }
 
@@ -160,17 +216,23 @@ const server = http.createServer((req, res) => {
 (async () => {
   server.listen(PORT, () => {
     console.log(`\nServer op poort ${PORT}`);
-    console.log(`Plan: 1 credit/5min = max 290 credits/dag (limiet 800)\n`);
+    console.log(`Verversing: elke 20 min tijdens beurs (ma-vr 15:30-22:00 BE)\n`);
   });
 
   priceCache.eurUsd = await fetchEurUsd();
   console.log(`EUR/USD: ${priceCache.eurUsd}`);
 
-  await fetchPreviousClose();
-  await fetchAllPrices();
+  // Wacht 65s bij opstart voor rate limit reset
+  console.log('Wacht 65s voor rate limit reset...');
+  await sleep(65000);
 
-  setInterval(fetchAllPrices, INTERVAL_MS);
-  setInterval(fetchPreviousClose, 24 * 60 * 60 * 1000);
+  // Eerste tick
+  await tick();
+
+  // Check elke minuut
+  setInterval(tick, 60 * 1000);
+
+  // EUR/USD elk uur
   setInterval(async () => {
     priceCache.eurUsd = await fetchEurUsd();
   }, 60 * 60 * 1000);
