@@ -229,11 +229,24 @@ const server = http.createServer((req, res) => {
   // Eerste tick
   await tick();
 
-  // Check elke minuut
+  // Check elke minuut of beurs open is
   setInterval(tick, 60 * 1000);
 
   // EUR/USD elk uur
   setInterval(async () => {
     priceCache.eurUsd = await fetchEurUsd();
   }, 60 * 60 * 1000);
+
+  // ── Keep-alive: ping zichzelf elke 10 min ──
+  // Voorkomt dat Render de server in slaap legt na 15 min inactiviteit
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  setInterval(() => {
+    https.get(SELF_URL + '/health', res => {
+      console.log(`[keep-alive] ping OK (${res.statusCode})`);
+    }).on('error', () => {
+      // Probeer via http als https mislukt
+      http.get(`http://localhost:${PORT}/health`, () => {}).on('error', () => {});
+    });
+  }, 10 * 60 * 1000); // elke 10 minuten
+
 })();
